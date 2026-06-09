@@ -18,8 +18,8 @@
 
 // ================= 实例化对象 =================
 HardwareSerial MotorSerial(1);
-UnitreeGoMotor motor_left(&MotorSerial, 0, EN_PIN);
-UnitreeGoMotor motor_right(&MotorSerial, 1, EN_PIN);
+UnitreeGoMotor motor_left(&MotorSerial, 1, EN_PIN);
+UnitreeGoMotor motor_right(&MotorSerial, 0, EN_PIN);
 ExoController exo_left(&motor_left, "Left", 1);
 ExoController exo_right(&motor_right, "Right", -1);
 TM1650 display; 
@@ -35,10 +35,17 @@ unsigned long lastDebounceTime = 0; // 上次抖动时间
 const unsigned long debounceDelay = 50; // 消抖延迟 (50毫秒)
 
 bool isSettingMode = false;         // 系统是否处于设置模式
-
+//旋转编码器
+const int pinA = 33;
+const int pinB = 32;
+int counter = 0; 
+int lastStateA;  
 // ================= 主程序 =================
 void setup() {
     Serial.begin(115200); 
+    //拉起旋转编码器针口
+    pinMode(pinA, INPUT_PULLUP);
+    pinMode(pinB, INPUT_PULLUP);
     
     // 初始化 UI 硬件
     pinMode(POT_PIN, INPUT);
@@ -59,7 +66,7 @@ void setup() {
     motor_left.begin();
     motor_right.begin();
     
-    Serial.println("【系统】双电机初始化中...");
+    Serial.println("【系统】双电机初始化中...1");
     delay(2000); 
 
     exo_left.begin();
@@ -69,67 +76,79 @@ void setup() {
     
     // 开机时在数码管上显示初始扭矩 0.00
     display.displayString("0.00");
+    lastStateA = digitalRead(pinA);   
 }
 
 void loop() {
     // ==========================================================
-    // 任务 1：按键监听与状态切换 (非阻塞消抖算法)
+    // 任务 1：按键监听与状态切换 (非阻塞消抖算法) - 保持不变
     // ==========================================================
     int currentReading = digitalRead(BTN_PIN);
 
-    // 如果引脚电平发生跳变（不论是按下还是松开），重置消抖计时器
     if (currentReading != lastButtonReading) {
         lastDebounceTime = millis();
     }
 
-    // 如果引脚电平保持稳定的时间超过了 50ms (说明不是干扰)
     if ((millis() - lastDebounceTime) > debounceDelay) {
-        
-        // 确认状态确实发生了改变
         if (currentReading != buttonState) {
             buttonState = currentReading;
-
-            // 【触发条件】：按下后松开 (电平由 LOW 变回 HIGH)
             if (buttonState == HIGH) {
                 isSettingMode = !isSettingMode; // 翻转模式
-                
-                // 1. 切换 LED 状态
                 digitalWrite(LED_PIN, isSettingMode ? HIGH : LOW);
-                
-                // 2. 通知下层电机控制器
                 exo_left.setSettingMode(isSettingMode);
                 exo_right.setSettingMode(isSettingMode);
                 
-                // 3. 串口提示
                 if (isSettingMode) {
-                    Serial.println(">>> 切换至【设置模式】：动力切断，可旋转电位器调节扭矩 <<<");
+                    Serial.println(">>> 切换至【设置模式】：动力切断，可旋转编码器调节扭矩 <<<");
                 } else {
-                    Serial.println(">>> 切换至【运行模式】：电位器已锁定，动力恢复！ <<<");
+                    Serial.println(">>> 切换至【运行模式】：编码器已锁定，动力恢复！ <<<");
                 }
             }
         }
     }
-    lastButtonReading = currentReading; // 保存本次物理读数
+    lastButtonReading = currentReading; 
 
     // ==========================================================
-    // 任务 2：电机极速控制循环 (500Hz)
+    // 【修正】任务 1.5：编码器高频轮询（移出UI定时器，全速运行）
+    // ==========================================================
+    if (isSettingMode) {
+        int currentStateA = digitalRead(pinA);
+        
+        // 只有当 A 相状态发生改变时才处理
+        if (currentStateA != lastStateA) {     
+            // 如果 A 相变化后的状态与 B 相当前状态不同，说明是顺时针
+            if (digitalRead(pinB) != currentStateA) { 
+                counter++; 
+            } else {
+                counter--; 
+            }
+            
+            // 【关键修正 1】：限制 counter 的范围，防止无限增大或变成负数
+            // 假设我们希望扭矩 0.00 ~ 0.80，每拨动一格改变 0.01，那么 counter 范围设为 0~80
+            if (counter < 0)  counter = 0;
+            if (counter > 80) counter = 80;
+        }  
+        lastStateA = currentStateA; // 【关键修正 2】：必须更新状态
+    }
+
+    // ==========================================================
+    // 任务 2：电机极速控制循环 (500Hz) - 保持不变
     // ==========================================================
     exo_left.run();
     exo_right.run();
 
     // ==========================================================
-    // 任务 3：UI 刷新与电位器读取 (10Hz)
+    // 任务 3：UI 刷新与数据显示 (10Hz)
     // ==========================================================
     unsigned long currentMillis = millis();
     if (currentMillis - lastUITime >= 100) {
         lastUITime = currentMillis;
 
-        // 【防误触安全锁】：只有处于设置模式时，才会读取电位器并更新扭矩
         if (isSettingMode) {
-            int raw_pot = analogRead(POT_PIN);
-            filtered_pot_val = 0.8 * filtered_pot_val + 0.2 * raw_pot;
-            
-            float current_max_torque = (filtered_pot_val / 4095.0) * 0.80;
+            // 【关键修正 3】：重新设计编码器数值到扭矩的转换逻辑
+            // 一格代表 0.01 N·m
+            float current_max_torque = counter * 0.01; 
+
             if (current_max_torque < 0.01) current_max_torque = 0.0;
             if (current_max_torque > 0.79) current_max_torque = 0.80;
 
@@ -142,6 +161,5 @@ void loop() {
             sprintf(display_buf, "%.2f", current_max_torque);
             display.displayString(display_buf);
         }
-        // 如果不在设置模式（运行模式中），完全跳过电位器读取，维持上一次设置的值，数码管也保持常亮。
     }
 }
